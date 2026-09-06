@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use cpan_distribution_meta::Meta;
+
+use crate::perl::{ExecuteResult, Perl};
 
 /// The build tool a CPAN distribution uses for its configure step.
 ///
@@ -151,10 +152,12 @@ fn deps_from_map(map: &BTreeMap<String, String>) -> Vec<Dependency> {
 /// Construct one with [`Distribution::new`] (or [`Distribution::with_preference`]
 /// to choose between EUMM and MB), passing the path to the directory that
 /// contains the distribution — the directory holding `Makefile.PL` / `Build.PL`,
-/// `META.json`, and so on.
+/// `META.json`, and so on — together with the [`Perl`] wrapper that
+/// [`execute_configure`] (and any later build/install step) will run through.
 ///
 /// On construction the static metadata is read and parsed straight away, and the
 /// [`build_tool`](Self::build_tool) is resolved from the scripts present. The
+/// supplied [`Perl`] is reconfigured to run in [`root`](Self::root). The
 /// generated `MYMETA` metadata only exists once [`execute_configure`] has run;
 /// that method loads it, or you can load it on its own with [`read_mymeta`].
 ///
@@ -165,6 +168,10 @@ fn deps_from_map(map: &BTreeMap<String, String>) -> Vec<Dependency> {
 pub struct Distribution {
     /// The directory containing the distribution.
     pub root: PathBuf,
+
+    /// The Perl interpreter and environment used to run the distribution's
+    /// build steps. Set to run in [`root`](Self::root) on construction.
+    pub perl: Perl,
 
     /// Metadata parsed from the distribution's `META.json`, or from `META.yml`
     /// when there is no `META.json`. Read when the [`Distribution`] is created.
@@ -186,25 +193,26 @@ pub struct Distribution {
 }
 
 impl Distribution {
-    /// Open the CPAN distribution rooted at `path`, preferring MB
-    /// ([`BuildTool::ModuleBuild`]) when it ships both `Build.PL` and
-    /// `Makefile.PL`.
+    /// Open the CPAN distribution rooted at `path`, to be built with `perl`,
+    /// preferring MB ([`BuildTool::ModuleBuild`]) when it ships both `Build.PL`
+    /// and `Makefile.PL`.
     ///
     /// `META.json` is read and parsed immediately; if it does not exist,
     /// `META.yml` is used instead. An error is returned if neither metadata file
     /// is present (or the one found cannot be parsed), or if the distribution
     /// has neither `Build.PL` nor `Makefile.PL`.
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::with_preference(path, BuildTool::default())
+    pub fn new<P: AsRef<Path>>(path: P, perl: Perl) -> Result<Self> {
+        Self::with_preference(path, perl, BuildTool::default())
     }
 
-    /// Open the CPAN distribution rooted at `path`, choosing `prefer` as the
-    /// build tool when it ships **both** `Build.PL` and `Makefile.PL`.
+    /// Open the CPAN distribution rooted at `path`, to be built with `perl`,
+    /// choosing `prefer` as the build tool when it ships **both** `Build.PL` and
+    /// `Makefile.PL`.
     ///
     /// When only one of the two scripts is present, that one is used regardless
     /// of `prefer`. Metadata handling and the error cases are as for
     /// [`Distribution::new`].
-    pub fn with_preference<P: AsRef<Path>>(path: P, prefer: BuildTool) -> Result<Self> {
+    pub fn with_preference<P: AsRef<Path>>(path: P, perl: Perl, prefer: BuildTool) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         let distribution_meta = read_meta(&root, &["META.json", "META.yml"])?
             .ok_or_else(|| anyhow!("no META.json or META.yml in {}", root.display()))?;
@@ -219,6 +227,7 @@ impl Distribution {
         };
 
         Ok(Self {
+            perl: perl.with_current_dir(&root),
             root,
             distribution_meta,
             distribution_mymeta: None,
@@ -265,41 +274,39 @@ impl Distribution {
     }
 
     /// Run the configure step: `perl Build.PL` for [`BuildTool::ModuleBuild`], or
-    /// `perl Makefile.PL` for [`BuildTool::Eumm`], in the distribution root.
+    /// `perl Makefile.PL` for [`BuildTool::Eumm`], through [`perl`](Self::perl)
+    /// (which runs it in [`root`](Self::root) with the CPAN build environment
+    /// applied).
     ///
-    /// The child process inherits this process's stdout/stderr. Returns an error
-    /// if `perl` cannot be spawned or the script exits non-zero.
+    /// Returns the [`ExecuteResult`] paired with the distribution's
+    /// [`Dependencies`]. A non-zero exit is reported in the [`ExecuteResult`],
+    /// not as an error; an `Err` means `perl` could not be spawned, the script
+    /// is missing, or a produced `MYMETA.*` could not be parsed.
     ///
     /// The configure step normally writes a `MYMETA.json` / `MYMETA.yml` with the
     /// prerequisites resolved for the current environment. If one is present
     /// afterwards it is parsed into [`distribution_mymeta`](Self::distribution_mymeta)
-    /// and its prereqs are returned; otherwise the returned [`Dependencies`] come
-    /// from [`distribution_meta`](Self::distribution_meta).
-    pub fn execute_configure(&mut self) -> Result<Dependencies> {
+    /// and the returned [`Dependencies`] come from it; otherwise they come from
+    /// [`distribution_meta`](Self::distribution_meta).
+    pub fn execute_configure(&mut self) -> Result<(ExecuteResult, Dependencies)> {
         let script = self.build_tool.configure_script();
         if !self.root.join(script).is_file() {
             bail!("{script} not found in {}", self.root.display());
         }
 
-        let status = Command::new("perl")
-            .arg(script)
-            .current_dir(&self.root)
-            .status()
-            .with_context(|| format!("failed to run `perl {script}` in {}", self.root.display()))?;
-
-        if !status.success() {
-            bail!("`perl {script}` exited with {status}");
-        }
+        let result = self.perl.execute_perl([script])?;
 
         if let Some(mymeta) = read_meta(&self.root, &["MYMETA.json", "MYMETA.yml"])? {
             self.distribution_mymeta = Some(mymeta);
         }
 
-        Ok(Dependencies::from_meta(
+        let dependencies = Dependencies::from_meta(
             self.distribution_mymeta
                 .as_ref()
                 .unwrap_or(&self.distribution_meta),
-        ))
+        );
+
+        Ok((result, dependencies))
     }
 
     /// Read `MYMETA.json` (or `MYMETA.yml` when there is no `MYMETA.json`) from
@@ -313,6 +320,38 @@ impl Distribution {
         let mymeta = read_meta(&self.root, &["MYMETA.json", "MYMETA.yml"])?
             .ok_or_else(|| anyhow!("no MYMETA.json or MYMETA.yml in {}", self.root.display()))?;
         Ok(self.distribution_mymeta.insert(mymeta))
+    }
+
+    /// Run the build step through [`perl`](Self::perl) (in [`root`](Self::root),
+    /// with the CPAN build environment applied): `make` for
+    /// [`BuildTool::Eumm`], or `perl Build` for [`BuildTool::ModuleBuild`].
+    ///
+    /// This runs after [`execute_configure`](Self::execute_configure), which
+    /// generates the `Makefile` / `Build` script invoked here; an error is
+    /// returned if that artifact is missing (or, for EUMM, if no `make` is
+    /// available). A non-zero exit is reported in the returned [`ExecuteResult`],
+    /// not as an error.
+    pub fn execute_build(&self) -> Result<ExecuteResult> {
+        match self.build_tool {
+            BuildTool::Eumm => {
+                if !self.root.join("Makefile").is_file() {
+                    bail!(
+                        "Makefile not found in {}; run execute_configure first",
+                        self.root.display()
+                    );
+                }
+                self.perl.execute_make(std::iter::empty::<&str>())
+            }
+            BuildTool::ModuleBuild => {
+                if !self.root.join("Build").is_file() {
+                    bail!(
+                        "Build not found in {}; run execute_configure first",
+                        self.root.display()
+                    );
+                }
+                self.perl.execute_perl(["Build"])
+            }
+        }
     }
 }
 
@@ -334,8 +373,15 @@ fn read_meta(root: &Path, candidates: &[&str]) -> Result<Option<Meta>> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     use tempfile::TempDir;
+
+    /// A `Perl` wrapper for tests that never actually runs `perl` (or whose test
+    /// is `perl`-gated). `with_perl` does not require the interpreter to exist.
+    fn test_perl() -> Perl {
+        Perl::with_perl("perl")
+    }
 
     const META_JSON: &str = r#"{
         "name": "Foo-Bar",
@@ -408,10 +454,17 @@ mod tests {
     #[test]
     fn reads_meta_json_immediately() {
         let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert_eq!(dist.distribution_meta.name, "Foo-Bar");
         assert_eq!(dist.distribution_meta.version, "1.23");
         assert!(dist.distribution_mymeta.is_none());
+    }
+
+    #[test]
+    fn construction_points_perl_at_the_distribution_root() {
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.perl.current_dir.as_deref(), Some(dir.path()));
     }
 
     #[test]
@@ -423,7 +476,7 @@ mod tests {
             ("META.yml", META_YML),
             ("Build.PL", "1;\n"),
         ]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert_eq!(
             dist.distribution_meta.spec_version,
             cpan_distribution_meta::SpecVersion::V2
@@ -433,7 +486,7 @@ mod tests {
     #[test]
     fn falls_back_to_meta_yml() {
         let dir = dist_with(&[("META.yml", META_YML), ("Makefile.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert_eq!(dist.distribution_meta.name, "Foo-Bar");
         assert_eq!(
             dist.distribution_meta.spec_version,
@@ -444,14 +497,14 @@ mod tests {
     #[test]
     fn errors_when_no_meta_present() {
         let dir = dist_with(&[("Build.PL", "1;\n")]);
-        let err = Distribution::new(dir.path()).unwrap_err();
+        let err = Distribution::new(dir.path(), test_perl()).unwrap_err();
         assert!(err.to_string().contains("no META.json or META.yml"));
     }
 
     #[test]
     fn errors_when_no_configure_script() {
         let dir = dist_with(&[("META.json", META_JSON)]);
-        let err = Distribution::new(dir.path()).unwrap_err();
+        let err = Distribution::new(dir.path(), test_perl()).unwrap_err();
         assert!(err.to_string().contains("no Build.PL or Makefile.PL"));
     }
 
@@ -462,7 +515,7 @@ mod tests {
             ("Build.PL", "1;\n"),
             ("Makefile.PL", "1;\n"),
         ]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
     }
 
@@ -473,18 +526,19 @@ mod tests {
             ("Build.PL", "1;\n"),
             ("Makefile.PL", "1;\n"),
         ]);
-        let dist = Distribution::with_preference(dir.path(), BuildTool::Eumm).unwrap();
+        let dist = Distribution::with_preference(dir.path(), test_perl(), BuildTool::Eumm).unwrap();
         assert_eq!(dist.build_tool, BuildTool::Eumm);
     }
 
     #[test]
     fn single_script_wins_over_preference() {
         let dir = dist_with(&[("META.json", META_JSON), ("Makefile.PL", "1;\n")]);
-        let dist = Distribution::with_preference(dir.path(), BuildTool::ModuleBuild).unwrap();
+        let dist =
+            Distribution::with_preference(dir.path(), test_perl(), BuildTool::ModuleBuild).unwrap();
         assert_eq!(dist.build_tool, BuildTool::Eumm);
 
         let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
-        let dist = Distribution::with_preference(dir.path(), BuildTool::Eumm).unwrap();
+        let dist = Distribution::with_preference(dir.path(), test_perl(), BuildTool::Eumm).unwrap();
         assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
     }
 
@@ -492,7 +546,7 @@ mod tests {
     fn pre_configure_lists_configure_requires_without_perl_and_adds_tool() {
         let meta = meta_with_configure(r#""File::Which": "1.09", "perl": "5.010""#);
         let dir = dist_with(&[("META.json", &meta), ("Build.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
 
         let deps = dist.execute_pre_configure();
         assert_eq!(
@@ -514,7 +568,7 @@ mod tests {
     fn pre_configure_keeps_named_mb_implementation() {
         let meta = meta_with_configure(r#""Module::Build::Tiny": "0.034""#);
         let dir = dist_with(&[("META.json", &meta), ("Build.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
 
         let deps = dist.execute_pre_configure();
         assert_eq!(
@@ -529,7 +583,7 @@ mod tests {
     #[test]
     fn pre_configure_adds_eumm_for_makefile_pl() {
         let dir = dist_with(&[("META.json", META_JSON), ("Makefile.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
 
         let deps = dist.execute_pre_configure();
         assert_eq!(
@@ -544,7 +598,7 @@ mod tests {
     #[test]
     fn dependencies_from_meta_group_by_phase_and_relationship() {
         let dir = dist_with(&[("META.json", META_MULTI_PHASE), ("Makefile.PL", "1;\n")]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
 
         let deps = Dependencies::from_meta(&dist.distribution_meta);
         // Sorted by module name; `perl` is kept (this is the full picture).
@@ -575,10 +629,11 @@ mod tests {
              \"prereqs\":{\"runtime\":{\"requires\":{\"Moo\":\"2.0\"}}}}';\n\
              close $fh;\n";
         let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", build_pl)]);
-        let mut dist = Distribution::new(dir.path()).unwrap();
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
 
-        let deps = dist.execute_configure().unwrap();
+        let (result, deps) = dist.execute_configure().unwrap();
+        assert!(result.is_success);
         assert_eq!(dist.distribution_mymeta.as_ref().unwrap().name, "Foo-Bar");
         assert_eq!(deps.runtime.requires, vec![dep("Moo", "2.0")]);
     }
@@ -590,15 +645,16 @@ mod tests {
             return;
         }
         let dir = dist_with(&[("META.json", META_MULTI_PHASE), ("Makefile.PL", "1;\n")]);
-        let mut dist = Distribution::new(dir.path()).unwrap();
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
 
-        let deps = dist.execute_configure().unwrap();
+        let (result, deps) = dist.execute_configure().unwrap();
+        assert!(result.is_success);
         assert!(dist.distribution_mymeta.is_none());
         assert_eq!(deps.test.requires, vec![dep("Test::More", "0.88")]);
     }
 
     #[test]
-    fn execute_configure_reports_script_failure() {
+    fn execute_configure_reports_script_failure_in_result() {
         if !perl_available() {
             eprintln!("skipping: no `perl` on PATH");
             return;
@@ -607,9 +663,74 @@ mod tests {
             ("META.json", META_JSON),
             ("Makefile.PL", "die \"boom\\n\";\n"),
         ]);
-        let mut dist = Distribution::new(dir.path()).unwrap();
-        let err = dist.execute_configure().unwrap_err();
-        assert!(err.to_string().contains("Makefile.PL"));
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
+
+        // A failing script is not an error; it is reported in the result, and
+        // dependencies fall back to distribution_meta.
+        let (result, deps) = dist.execute_configure().unwrap();
+        assert!(!result.is_success);
+        assert!(dist.distribution_mymeta.is_none());
+        assert_eq!(deps.runtime.requires, vec![dep("perl", "5.010")]);
+    }
+
+    #[test]
+    fn execute_build_errors_before_configure() {
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+        assert!(
+            dist.execute_build()
+                .unwrap_err()
+                .to_string()
+                .contains("Build not found")
+        );
+
+        let dir = dist_with(&[("META.json", META_JSON), ("Makefile.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+        assert!(
+            dist.execute_build()
+                .unwrap_err()
+                .to_string()
+                .contains("Makefile not found")
+        );
+    }
+
+    #[test]
+    fn execute_build_runs_perl_build_for_module_build() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Build.PL", "1;\n"),
+            ("Build", "print \"built\\n\"; exit 0;\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+
+        let result = dist.execute_build().unwrap();
+        assert!(result.is_success);
+        assert_eq!(result.code, Some(0));
+    }
+
+    #[test]
+    fn execute_build_runs_make_for_eumm() {
+        if which::which("make").is_err() {
+            eprintln!("skipping: no `make` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Makefile.PL", "1;\n"),
+            ("Makefile", "all:\n\t@true\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+
+        let result = dist.execute_build().unwrap();
+        assert!(result.is_success);
     }
 
     #[test]
@@ -619,7 +740,7 @@ mod tests {
             ("MYMETA.json", META_JSON),
             ("Build.PL", "1;\n"),
         ]);
-        let mut dist = Distribution::new(dir.path()).unwrap();
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert!(dist.distribution_mymeta.is_none());
 
         dist.read_mymeta().unwrap();
@@ -629,7 +750,7 @@ mod tests {
     #[test]
     fn read_mymeta_errors_when_absent() {
         let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
-        let mut dist = Distribution::new(dir.path()).unwrap();
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
         let err = dist.read_mymeta().unwrap_err();
         assert!(err.to_string().contains("no MYMETA.json or MYMETA.yml"));
     }

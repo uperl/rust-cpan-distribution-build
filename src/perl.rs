@@ -43,6 +43,10 @@ pub struct Perl {
     /// to this process's streams. Off by default; set with
     /// [`with_capture_output`](Self::with_capture_output).
     pub capture_output: bool,
+
+    /// Directory to run commands in. `None` (the default) uses this process's
+    /// working directory; set with [`with_current_dir`](Self::with_current_dir).
+    pub current_dir: Option<PathBuf>,
 }
 
 impl Perl {
@@ -73,6 +77,7 @@ impl Perl {
             install_base: None,
             lib: Vec::new(),
             capture_output: false,
+            current_dir: None,
         }
     }
 
@@ -89,6 +94,13 @@ impl Perl {
     #[must_use]
     pub fn with_capture_output(mut self, capture: bool) -> Self {
         self.capture_output = capture;
+        self
+    }
+
+    /// Run commands in `dir` ([`current_dir`](Self::current_dir)).
+    #[must_use]
+    pub fn with_current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
         self
     }
 
@@ -180,6 +192,9 @@ impl Perl {
     pub fn perl_command(&self) -> Command {
         let mut cmd = Command::new(&self.perl);
         self.apply_env(&mut cmd);
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
         cmd
     }
 
@@ -192,6 +207,9 @@ impl Perl {
             .ok_or_else(|| anyhow!("no `make` executable is available"))?;
         let mut cmd = Command::new(make);
         self.apply_env(&mut cmd);
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
         Ok(cmd)
     }
 
@@ -423,6 +441,7 @@ mod tests {
             install_base: None,
             lib: Vec::new(),
             capture_output: false,
+            current_dir: None,
         };
         let cmd = perl.perl_command();
         let env = env_of(&cmd);
@@ -449,6 +468,7 @@ mod tests {
             install_base: None,
             lib: Vec::new(),
             capture_output: false,
+            current_dir: None,
         };
         assert!(perl.make_command().is_err());
         assert!(
@@ -464,6 +484,18 @@ mod tests {
         let perl = Perl::with_perl("/usr/bin/perl");
         assert!(!perl.capture_output);
         assert!(perl.with_capture_output(true).capture_output);
+    }
+
+    #[test]
+    fn with_current_dir_sets_the_command_working_directory() {
+        let plain = Perl::with_perl("/usr/bin/perl").perl_command();
+        assert_eq!(plain.get_current_dir(), None);
+
+        let perl = Perl::with_perl("/usr/bin/perl").with_current_dir("/tmp/build");
+        assert_eq!(
+            perl.perl_command().get_current_dir(),
+            Some(Path::new("/tmp/build"))
+        );
     }
 
     #[test]
