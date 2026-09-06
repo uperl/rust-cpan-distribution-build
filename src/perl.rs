@@ -126,12 +126,25 @@ impl Perl {
 
     /// Apply the CPAN build environment to `cmd`:
     ///
+    /// * `PERL` is set to [`perl`](Self::perl).
+    /// * `MAKE` is set to [`make`](Self::make), or unset when it is `None`.
     /// * `PERL5LIB` is set from [`lib`](Self::lib), or unset when `lib` is empty.
     /// * `PERLLIB` is always unset (so it cannot shadow `PERL5LIB`).
     /// * `PERL_LOCAL_LIB_ROOT`, `PERL_MB_OPT` and `PERL_MM_OPT` are set from
     ///   [`install_base`](Self::install_base) in the same way `local::lib` does,
     ///   or unset when it is `None`.
     fn apply_env(&self, cmd: &mut Command) {
+        cmd.env("PERL", &self.perl);
+
+        match self.make.as_deref() {
+            Some(make) => {
+                cmd.env("MAKE", make);
+            }
+            None => {
+                cmd.env_remove("MAKE");
+            }
+        }
+
         if self.lib.is_empty() {
             cmd.env_remove("PERL5LIB");
         } else {
@@ -184,6 +197,8 @@ impl Perl {
 
     /// Run [`perl`](Self::perl) with `args`, after adjusting the environment:
     ///
+    /// * `PERL` is set to [`perl`](Self::perl).
+    /// * `MAKE` is set to [`make`](Self::make), or unset when it is `None`.
     /// * `PERL5LIB` is set from [`lib`](Self::lib), or unset when `lib` is empty.
     /// * `PERLLIB` is always unset (so it cannot shadow `PERL5LIB`).
     /// * `PERL_LOCAL_LIB_ROOT`, `PERL_MB_OPT` and `PERL_MM_OPT` are set from
@@ -373,11 +388,14 @@ mod tests {
     #[test]
     fn command_sets_env_from_lib_and_install_base() {
         let perl = Perl::with_perl("/usr/bin/perl")
+            .with_make("/usr/bin/make")
             .with_lib(["/a/lib", "/b/lib"])
             .with_install_base("/opt/pl");
         let cmd = perl.perl_command();
         let env = env_of(&cmd);
 
+        assert_eq!(env[OsStr::new("PERL")], Some(OsStr::new("/usr/bin/perl")));
+        assert_eq!(env[OsStr::new("MAKE")], Some(OsStr::new("/usr/bin/make")));
         assert_eq!(
             env[OsStr::new("PERL5LIB")],
             Some(OsStr::new("/a/lib:/b/lib"))
@@ -398,12 +416,21 @@ mod tests {
     }
 
     #[test]
-    fn command_unsets_env_when_lib_empty_and_no_install_base() {
-        let perl = Perl::with_perl("/usr/bin/perl");
+    fn command_unsets_env_when_nothing_configured() {
+        let perl = Perl {
+            perl: PathBuf::from("/usr/bin/perl"),
+            make: None,
+            install_base: None,
+            lib: Vec::new(),
+            capture_output: false,
+        };
         let cmd = perl.perl_command();
         let env = env_of(&cmd);
 
+        // `PERL` is always set; everything else is cleared.
+        assert_eq!(env[OsStr::new("PERL")], Some(OsStr::new("/usr/bin/perl")));
         for key in [
+            "MAKE",
             "PERL5LIB",
             "PERLLIB",
             "PERL_LOCAL_LIB_ROOT",
