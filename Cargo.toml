@@ -8,5 +8,9 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
+cpan-distribution-meta = { git = "https://github.com/uperl/rust-cpan-distribution-meta.git", tag = "v0.1.1", version = "0.1.1" }
+
+[dev-dependencies]
+tempfile = "3"
 
 
