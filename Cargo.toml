@@ -1,6 +1,6 @@
 [package]
 name = "cpan-distribution-build"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Build and install a CPAN distribution programatically."
 repository = "https://github.com/uperl/cpan-distribution-build"
