@@ -344,6 +344,18 @@ impl Distribution {
         self.run_build_target(Some("test"))
     }
 
+    /// Install the built distribution through [`perl`](Self::perl): `make
+    /// install` for [`BuildTool::Eumm`], or `perl Build install` for
+    /// [`BuildTool::ModuleBuild`].
+    ///
+    /// Where files land is governed by the [`perl`](Self::perl) wrapper's
+    /// `install_base`. Runs after [`execute_build`](Self::execute_build); the
+    /// requirements and error behaviour are the same as for
+    /// [`execute_build`](Self::execute_build).
+    pub fn execute_install(&self) -> Result<ExecuteResult> {
+        self.run_build_target(Some("install"))
+    }
+
     /// Shared driver for [`execute_build`](Self::execute_build) and
     /// [`execute_test`](Self::execute_test): invoke the generated build script
     /// with an optional target (`None` builds the default target).
@@ -786,6 +798,41 @@ mod tests {
 
         assert!(dist.execute_test().unwrap().is_success);
         assert!(!dist.execute_build().unwrap().is_success);
+    }
+
+    #[test]
+    fn execute_install_passes_the_install_target_for_module_build() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Build.PL", "1;\n"),
+            ("Build", "exit(($ARGV[0] // '') eq 'install' ? 0 : 1);\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+
+        assert!(dist.execute_install().unwrap().is_success);
+        assert!(!dist.execute_build().unwrap().is_success);
+    }
+
+    #[test]
+    fn execute_install_runs_make_install_for_eumm() {
+        if which::which("make").is_err() {
+            eprintln!("skipping: no `make` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Makefile.PL", "1;\n"),
+            ("Makefile", "all:\n\t@false\ninstall:\n\t@true\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+
+        assert!(dist.execute_install().unwrap().is_success);
     }
 
     #[test]
