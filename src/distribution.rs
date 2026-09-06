@@ -332,6 +332,22 @@ impl Distribution {
     /// available). A non-zero exit is reported in the returned [`ExecuteResult`],
     /// not as an error.
     pub fn execute_build(&self) -> Result<ExecuteResult> {
+        self.run_build_target(None)
+    }
+
+    /// Run the test suite through [`perl`](Self::perl): `make test` for
+    /// [`BuildTool::Eumm`], or `perl Build test` for [`BuildTool::ModuleBuild`].
+    ///
+    /// Runs after [`execute_build`](Self::execute_build); the requirements and
+    /// error behaviour are the same as for [`execute_build`](Self::execute_build).
+    pub fn execute_test(&self) -> Result<ExecuteResult> {
+        self.run_build_target(Some("test"))
+    }
+
+    /// Shared driver for [`execute_build`](Self::execute_build) and
+    /// [`execute_test`](Self::execute_test): invoke the generated build script
+    /// with an optional target (`None` builds the default target).
+    fn run_build_target(&self, target: Option<&str>) -> Result<ExecuteResult> {
         match self.build_tool {
             BuildTool::Eumm => {
                 if !self.root.join("Makefile").is_file() {
@@ -340,7 +356,7 @@ impl Distribution {
                         self.root.display()
                     );
                 }
-                self.perl.execute_make(std::iter::empty::<&str>())
+                self.perl.execute_make(target)
             }
             BuildTool::ModuleBuild => {
                 if !self.root.join("Build").is_file() {
@@ -349,7 +365,8 @@ impl Distribution {
                         self.root.display()
                     );
                 }
-                self.perl.execute_perl(["Build"])
+                let args: Vec<&str> = std::iter::once("Build").chain(target).collect();
+                self.perl.execute_perl(args)
             }
         }
     }
@@ -731,6 +748,44 @@ mod tests {
 
         let result = dist.execute_build().unwrap();
         assert!(result.is_success);
+    }
+
+    #[test]
+    fn execute_test_passes_the_test_target_for_module_build() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        // `perl Build test` -> ok; `perl Build` -> fails.
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Build.PL", "1;\n"),
+            ("Build", "exit(($ARGV[0] // '') eq 'test' ? 0 : 1);\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+
+        assert!(dist.execute_test().unwrap().is_success);
+        assert!(!dist.execute_build().unwrap().is_success);
+    }
+
+    #[test]
+    fn execute_test_runs_make_test_for_eumm() {
+        if which::which("make").is_err() {
+            eprintln!("skipping: no `make` on PATH");
+            return;
+        }
+        // `make` (default target) fails; `make test` succeeds.
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Makefile.PL", "1;\n"),
+            ("Makefile", "all:\n\t@false\ntest:\n\t@true\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+
+        assert!(dist.execute_test().unwrap().is_success);
+        assert!(!dist.execute_build().unwrap().is_success);
     }
 
     #[test]
