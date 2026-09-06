@@ -4,4 +4,4 @@ mod distribution;
 mod perl;
 
 pub use distribution::{BuildTool, Dependencies, Dependency, Distribution, PhaseDependencies};
-pub use perl::Perl;
+pub use perl::{ExecuteResult, Perl};

@@ -1,10 +1,13 @@
 //! A configured Perl interpreter: where `perl` and `make` live, where newly
 //! built modules are installed, and which directories go on `PERL5LIB`.
 
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 /// A wrapper around a Perl interpreter and the environment used to build and
 /// install CPAN distributions with it.
@@ -33,6 +36,13 @@ pub struct Perl {
     /// platform path separator by [`perl5lib`](Self::perl5lib) to form the
     /// `PERL5LIB` environment variable.
     pub lib: Vec<PathBuf>,
+
+    /// When `true`, [`execute_perl`](Self::execute_perl) and
+    /// [`execute_make`](Self::execute_make) capture the child's merged
+    /// stdout+stderr into [`ExecuteResult::output`] instead of letting it write
+    /// to this process's streams. Off by default; set with
+    /// [`with_capture_output`](Self::with_capture_output).
+    pub capture_output: bool,
 }
 
 impl Perl {
@@ -62,6 +72,7 @@ impl Perl {
             make: which::which("make").ok(),
             install_base: None,
             lib: Vec::new(),
+            capture_output: false,
         }
     }
 
@@ -70,6 +81,14 @@ impl Perl {
     #[must_use]
     pub fn with_install_base(mut self, install_base: impl Into<PathBuf>) -> Self {
         self.install_base = Some(install_base.into());
+        self
+    }
+
+    /// Enable or disable capturing the child's merged stdout+stderr
+    /// ([`capture_output`](Self::capture_output)).
+    #[must_use]
+    pub fn with_capture_output(mut self, capture: bool) -> Self {
+        self.capture_output = capture;
         self
     }
 
@@ -104,12 +123,188 @@ impl Perl {
         }
         value
     }
+
+    /// Apply the CPAN build environment to `cmd`:
+    ///
+    /// * `PERL5LIB` is set from [`lib`](Self::lib), or unset when `lib` is empty.
+    /// * `PERLLIB` is always unset (so it cannot shadow `PERL5LIB`).
+    /// * `PERL_LOCAL_LIB_ROOT`, `PERL_MB_OPT` and `PERL_MM_OPT` are set from
+    ///   [`install_base`](Self::install_base) in the same way `local::lib` does,
+    ///   or unset when it is `None`.
+    fn apply_env(&self, cmd: &mut Command) {
+        if self.lib.is_empty() {
+            cmd.env_remove("PERL5LIB");
+        } else {
+            cmd.env("PERL5LIB", self.perl5lib());
+        }
+
+        cmd.env_remove("PERLLIB");
+
+        match self.install_base.as_deref() {
+            Some(base) => {
+                cmd.env("PERL_LOCAL_LIB_ROOT", base);
+
+                let mut mb_opt = OsString::from("--install_base ");
+                mb_opt.push(base);
+                cmd.env("PERL_MB_OPT", mb_opt);
+
+                let mut mm_opt = OsString::from("INSTALL_BASE=");
+                mm_opt.push(base);
+                cmd.env("PERL_MM_OPT", mm_opt);
+            }
+            None => {
+                cmd.env_remove("PERL_LOCAL_LIB_ROOT");
+                cmd.env_remove("PERL_MB_OPT");
+                cmd.env_remove("PERL_MM_OPT");
+            }
+        }
+    }
+
+    /// A [`Command`] for [`perl`](Self::perl) with the CPAN build environment
+    /// applied (the same one [`execute_perl`](Self::execute_perl) sets up) and no
+    /// arguments set. Use it when you need to customise the command (working
+    /// directory, captured output, extra environment) before running it.
+    pub fn perl_command(&self) -> Command {
+        let mut cmd = Command::new(&self.perl);
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    /// A [`Command`] for [`make`](Self::make) with the CPAN build environment
+    /// applied and no arguments set. Errors when there is no `make` available.
+    pub fn make_command(&self) -> Result<Command> {
+        let make = self
+            .make
+            .as_deref()
+            .ok_or_else(|| anyhow!("no `make` executable is available"))?;
+        let mut cmd = Command::new(make);
+        self.apply_env(&mut cmd);
+        Ok(cmd)
+    }
+
+    /// Run [`perl`](Self::perl) with `args`, after adjusting the environment:
+    ///
+    /// * `PERL5LIB` is set from [`lib`](Self::lib), or unset when `lib` is empty.
+    /// * `PERLLIB` is always unset (so it cannot shadow `PERL5LIB`).
+    /// * `PERL_LOCAL_LIB_ROOT`, `PERL_MB_OPT` and `PERL_MM_OPT` are set from
+    ///   [`install_base`](Self::install_base) the same way `local::lib` does, or
+    ///   unset when it is `None`.
+    ///
+    /// The child inherits this process's stdio, unless
+    /// [`capture_output`](Self::capture_output) is set, in which case its merged
+    /// stdout+stderr is collected into
+    /// [`ExecuteResult::output`](ExecuteResult::output).
+    ///
+    /// A non-zero exit is reported in the returned [`ExecuteResult`], not as an
+    /// error; `Err` is only returned when the process cannot be spawned.
+    pub fn execute_perl<I, S>(&self, args: I) -> Result<ExecuteResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut cmd = self.perl_command();
+        cmd.args(args);
+        self.run(cmd, &self.perl)
+    }
+
+    /// Run [`make`](Self::make) with `args`, after applying the CPAN build
+    /// environment. Output is inherited or captured exactly as for
+    /// [`execute_perl`](Self::execute_perl).
+    ///
+    /// Errors when there is no `make` available or the process cannot be
+    /// spawned; a non-zero exit is reported in the returned [`ExecuteResult`].
+    pub fn execute_make<I, S>(&self, args: I) -> Result<ExecuteResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut cmd = self.make_command()?;
+        cmd.args(args);
+        let program = self.make.clone().unwrap_or_else(|| PathBuf::from("make"));
+        self.run(cmd, &program)
+    }
+
+    /// Spawn `cmd`, honouring [`capture_output`](Self::capture_output).
+    /// `program` is only used to describe the executable in error messages.
+    fn run(&self, mut cmd: Command, program: &Path) -> Result<ExecuteResult> {
+        let context = || format!("failed to run `{}`", program.display());
+
+        if !self.capture_output {
+            let status = cmd.status().with_context(context)?;
+            return Ok(ExecuteResult::new(status, None));
+        }
+
+        // Point both stdout and stderr at the write end of a single pipe so the
+        // captured buffer preserves the order the child wrote its lines in.
+        let (mut reader, writer) = os_pipe::pipe().context("failed to create an output pipe")?;
+        let writer_clone = writer
+            .try_clone()
+            .context("failed to set up output capture")?;
+        cmd.stdout(writer);
+        cmd.stderr(writer_clone);
+
+        let mut child = cmd.spawn().with_context(context)?;
+        // Drop this process's copies of the pipe's write end, so that reading
+        // reaches EOF once the child exits.
+        drop(cmd);
+
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .context("failed to read captured output")?;
+        let status = child
+            .wait()
+            .context("failed to wait for the child process")?;
+
+        Ok(ExecuteResult::new(status, Some(output)))
+    }
+}
+
+/// The outcome of running `perl` or `make` via [`Perl::execute_perl`] /
+/// [`Perl::execute_make`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecuteResult {
+    /// The process exit status.
+    pub status: ExitStatus,
+
+    /// `true` when the process exited with status zero.
+    pub is_success: bool,
+
+    /// The exit code, or `None` when the process was terminated by a signal.
+    pub code: Option<i32>,
+
+    /// The child's merged stdout+stderr, captured only when the [`Perl`] wrapper
+    /// had [`capture_output`](Perl::capture_output) set; `None` when the child
+    /// inherited this process's streams.
+    pub output: Option<Vec<u8>>,
+}
+
+impl ExecuteResult {
+    fn new(status: ExitStatus, output: Option<Vec<u8>>) -> Self {
+        Self {
+            status,
+            is_success: status.success(),
+            code: status.code(),
+            output,
+        }
+    }
+
+    /// The captured [`output`](Self::output) decoded as UTF-8, with invalid
+    /// sequences replaced. `None` when output was not captured.
+    pub fn output_lossy(&self) -> Option<Cow<'_, str>> {
+        self.output.as_deref().map(String::from_utf8_lossy)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::collections::HashMap;
+
+    fn have_perl() -> bool {
+        which::which("perl").is_ok()
+    }
 
     #[test]
     fn new_resolves_perl_from_path() {
@@ -169,5 +364,117 @@ mod tests {
     fn perl5lib_is_empty_without_lib_dirs() {
         let perl = Perl::with_perl("/usr/bin/perl");
         assert_eq!(perl.perl5lib(), OsString::new());
+    }
+
+    fn env_of(cmd: &Command) -> HashMap<&OsStr, Option<&OsStr>> {
+        cmd.get_envs().collect()
+    }
+
+    #[test]
+    fn command_sets_env_from_lib_and_install_base() {
+        let perl = Perl::with_perl("/usr/bin/perl")
+            .with_lib(["/a/lib", "/b/lib"])
+            .with_install_base("/opt/pl");
+        let cmd = perl.perl_command();
+        let env = env_of(&cmd);
+
+        assert_eq!(
+            env[OsStr::new("PERL5LIB")],
+            Some(OsStr::new("/a/lib:/b/lib"))
+        );
+        assert_eq!(env[OsStr::new("PERLLIB")], None);
+        assert_eq!(
+            env[OsStr::new("PERL_LOCAL_LIB_ROOT")],
+            Some(OsStr::new("/opt/pl"))
+        );
+        assert_eq!(
+            env[OsStr::new("PERL_MB_OPT")],
+            Some(OsStr::new("--install_base /opt/pl"))
+        );
+        assert_eq!(
+            env[OsStr::new("PERL_MM_OPT")],
+            Some(OsStr::new("INSTALL_BASE=/opt/pl"))
+        );
+    }
+
+    #[test]
+    fn command_unsets_env_when_lib_empty_and_no_install_base() {
+        let perl = Perl::with_perl("/usr/bin/perl");
+        let cmd = perl.perl_command();
+        let env = env_of(&cmd);
+
+        for key in [
+            "PERL5LIB",
+            "PERLLIB",
+            "PERL_LOCAL_LIB_ROOT",
+            "PERL_MB_OPT",
+            "PERL_MM_OPT",
+        ] {
+            assert_eq!(env[OsStr::new(key)], None, "{key} should be unset");
+        }
+    }
+
+    #[test]
+    fn make_command_errors_without_make() {
+        let perl = Perl {
+            perl: PathBuf::from("/usr/bin/perl"),
+            make: None,
+            install_base: None,
+            lib: Vec::new(),
+            capture_output: false,
+        };
+        assert!(perl.make_command().is_err());
+        assert!(
+            perl.execute_make(["all"])
+                .unwrap_err()
+                .to_string()
+                .contains("make")
+        );
+    }
+
+    #[test]
+    fn capture_output_is_off_by_default() {
+        let perl = Perl::with_perl("/usr/bin/perl");
+        assert!(!perl.capture_output);
+        assert!(perl.with_capture_output(true).capture_output);
+    }
+
+    #[test]
+    fn execute_perl_reports_success_and_exit_code() {
+        if !have_perl() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let perl = Perl::new().unwrap();
+
+        let ok = perl.execute_perl(["-e", "exit 0"]).unwrap();
+        assert!(ok.is_success);
+        assert_eq!(ok.code, Some(0));
+        assert!(ok.output.is_none(), "output not captured by default");
+
+        let bad = perl.execute_perl(["-e", "exit 3"]).unwrap();
+        assert!(!bad.is_success);
+        assert_eq!(bad.code, Some(3));
+    }
+
+    #[test]
+    fn execute_perl_captures_merged_output_when_enabled() {
+        if !have_perl() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let perl = Perl::new().unwrap().with_capture_output(true);
+        let result = perl
+            .execute_perl([
+                "-e",
+                r#"$| = 1; print "to stdout\n"; print STDERR "to stderr\n"; exit 7"#,
+            ])
+            .unwrap();
+
+        assert!(!result.is_success);
+        assert_eq!(result.code, Some(7));
+        let output = result.output_lossy().expect("output captured");
+        assert!(output.contains("to stdout"), "{output:?}");
+        assert!(output.contains("to stderr"), "{output:?}");
     }
 }
