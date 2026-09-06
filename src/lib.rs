@@ -2,4 +2,4 @@
 
 mod distribution;
 
-pub use distribution::{BuildTool, Dependency, Distribution};
+pub use distribution::{BuildTool, Dependencies, Dependency, Distribution, PhaseDependencies};

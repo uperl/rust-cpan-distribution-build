@@ -76,6 +76,76 @@ pub struct Dependency {
     pub version: String,
 }
 
+/// Every prerequisite of a distribution, grouped by phase and relationship.
+///
+/// This mirrors the CPAN Meta Spec `prereqs` structure (see
+/// [`cpan_distribution_meta::Prereqs`]), but with each group flattened to a
+/// plain list of [`Dependency`]. Build it from a parsed [`Meta`] with
+/// [`Dependencies::from_meta`]; [`Distribution::execute_configure`] returns one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dependencies {
+    /// Needed to run `Makefile.PL` / `Build.PL`.
+    pub configure: PhaseDependencies,
+    /// Needed to build the distribution, after the configure step.
+    pub build: PhaseDependencies,
+    /// Needed to run the test suite.
+    pub test: PhaseDependencies,
+    /// Needed to use the installed distribution at run time.
+    pub runtime: PhaseDependencies,
+    /// Needed only to work on the distribution itself.
+    pub develop: PhaseDependencies,
+}
+
+/// The prerequisites of a single phase, split by relationship.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseDependencies {
+    /// Hard requirements.
+    pub requires: Vec<Dependency>,
+    /// Optional; installed by default by most CPAN clients.
+    pub recommends: Vec<Dependency>,
+    /// Optional; not installed by default.
+    pub suggests: Vec<Dependency>,
+    /// Module/version combinations known to be incompatible.
+    pub conflicts: Vec<Dependency>,
+}
+
+impl Dependencies {
+    /// Collect the `prereqs` of a parsed [`Meta`] (a `META.*` or `MYMETA.*`
+    /// document) into a [`Dependencies`].
+    pub fn from_meta(meta: &Meta) -> Self {
+        let p = &meta.prereqs;
+        Self {
+            configure: PhaseDependencies::from_phase(&p.configure),
+            build: PhaseDependencies::from_phase(&p.build),
+            test: PhaseDependencies::from_phase(&p.test),
+            runtime: PhaseDependencies::from_phase(&p.runtime),
+            develop: PhaseDependencies::from_phase(&p.develop),
+        }
+    }
+}
+
+impl PhaseDependencies {
+    fn from_phase(phase: &cpan_distribution_meta::Phase) -> Self {
+        Self {
+            requires: deps_from_map(&phase.requires),
+            recommends: deps_from_map(&phase.recommends),
+            suggests: deps_from_map(&phase.suggests),
+            conflicts: deps_from_map(&phase.conflicts),
+        }
+    }
+}
+
+/// Convert a CPAN Meta `module => version-range` map into a sorted list of
+/// [`Dependency`].
+fn deps_from_map(map: &BTreeMap<String, String>) -> Vec<Dependency> {
+    map.iter()
+        .map(|(module, version)| Dependency {
+            module: module.clone(),
+            version: version.clone(),
+        })
+        .collect()
+}
+
 /// A Perl CPAN distribution laid out in a local filesystem directory.
 ///
 /// Construct one with [`Distribution::new`] (or [`Distribution::with_preference`]
@@ -85,8 +155,8 @@ pub struct Dependency {
 ///
 /// On construction the static metadata is read and parsed straight away, and the
 /// [`build_tool`](Self::build_tool) is resolved from the scripts present. The
-/// generated `MYMETA` metadata only exists once [`execute_configure`] has run,
-/// and is read separately with [`read_mymeta`].
+/// generated `MYMETA` metadata only exists once [`execute_configure`] has run;
+/// that method loads it, or you can load it on its own with [`read_mymeta`].
 ///
 /// [`execute_configure`]: Self::execute_configure
 /// [`read_mymeta`]: Self::read_mymeta
@@ -102,9 +172,10 @@ pub struct Distribution {
 
     /// Metadata parsed from the distribution's `MYMETA.json`, or from
     /// `MYMETA.yml` when there is no `MYMETA.json`. `MYMETA` files are written
-    /// by the configure step, so this is `None` until [`read_mymeta`] has
-    /// completed successfully.
+    /// by the configure step, so this is `None` until [`execute_configure`] or
+    /// [`read_mymeta`] has populated it.
     ///
+    /// [`execute_configure`]: Self::execute_configure
     /// [`read_mymeta`]: Self::read_mymeta
     pub distribution_mymeta: Option<Meta>,
 
@@ -197,10 +268,14 @@ impl Distribution {
     /// `perl Makefile.PL` for [`BuildTool::Eumm`], in the distribution root.
     ///
     /// The child process inherits this process's stdout/stderr. Returns an error
-    /// if `perl` cannot be spawned or the script exits non-zero. On success the
-    /// distribution has a generated `Build` / `Makefile` and `MYMETA.*` files;
-    /// call [`read_mymeta`](Self::read_mymeta) to load the latter.
-    pub fn execute_configure(&self) -> Result<()> {
+    /// if `perl` cannot be spawned or the script exits non-zero.
+    ///
+    /// The configure step normally writes a `MYMETA.json` / `MYMETA.yml` with the
+    /// prerequisites resolved for the current environment. If one is present
+    /// afterwards it is parsed into [`distribution_mymeta`](Self::distribution_mymeta)
+    /// and its prereqs are returned; otherwise the returned [`Dependencies`] come
+    /// from [`distribution_meta`](Self::distribution_meta).
+    pub fn execute_configure(&mut self) -> Result<Dependencies> {
         let script = self.build_tool.configure_script();
         if !self.root.join(script).is_file() {
             bail!("{script} not found in {}", self.root.display());
@@ -215,7 +290,16 @@ impl Distribution {
         if !status.success() {
             bail!("`perl {script}` exited with {status}");
         }
-        Ok(())
+
+        if let Some(mymeta) = read_meta(&self.root, &["MYMETA.json", "MYMETA.yml"])? {
+            self.distribution_mymeta = Some(mymeta);
+        }
+
+        Ok(Dependencies::from_meta(
+            self.distribution_mymeta
+                .as_ref()
+                .unwrap_or(&self.distribution_meta),
+        ))
     }
 
     /// Read `MYMETA.json` (or `MYMETA.yml` when there is no `MYMETA.json`) from
@@ -266,6 +350,29 @@ mod tests {
     }"#;
 
     const META_YML: &str = "---\nname: Foo-Bar\nversion: '1.23'\nabstract: a foo for bars\nlicense: perl\nrequires:\n  perl: '5.006'\nmeta-spec:\n  version: 1.4\n";
+
+    const META_MULTI_PHASE: &str = r#"{
+        "name": "Foo-Bar",
+        "version": "1.23",
+        "dynamic_config": 0,
+        "release_status": "stable",
+        "meta-spec": { "version": 2 },
+        "prereqs": {
+            "configure": { "requires": { "ExtUtils::MakeMaker": "0" } },
+            "runtime": {
+                "requires": { "perl": "5.010", "Carp": "0" },
+                "recommends": { "JSON::XS": "3.0" }
+            },
+            "test": { "requires": { "Test::More": "0.88" } }
+        }
+    }"#;
+
+    fn dep(module: &str, version: &str) -> Dependency {
+        Dependency {
+            module: module.into(),
+            version: version.into(),
+        }
+    }
 
     /// A `META.json` with the given `configure.requires` map body, e.g.
     /// `r#""Module::Build::Tiny": "0.034", "perl": "5.010""#`.
@@ -435,27 +542,59 @@ mod tests {
     }
 
     #[test]
-    fn execute_configure_runs_the_selected_script() {
+    fn dependencies_from_meta_group_by_phase_and_relationship() {
+        let dir = dist_with(&[("META.json", META_MULTI_PHASE), ("Makefile.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path()).unwrap();
+
+        let deps = Dependencies::from_meta(&dist.distribution_meta);
+        // Sorted by module name; `perl` is kept (this is the full picture).
+        assert_eq!(
+            deps.runtime.requires,
+            vec![dep("Carp", "0"), dep("perl", "5.010")]
+        );
+        assert_eq!(deps.runtime.recommends, vec![dep("JSON::XS", "3.0")]);
+        assert_eq!(deps.test.requires, vec![dep("Test::More", "0.88")]);
+        assert_eq!(
+            deps.configure.requires,
+            vec![dep("ExtUtils::MakeMaker", "0")]
+        );
+        assert!(deps.build.requires.is_empty());
+        assert!(deps.develop.requires.is_empty());
+        assert!(deps.runtime.suggests.is_empty());
+    }
+
+    #[test]
+    fn execute_configure_populates_mymeta_and_returns_its_deps() {
         if !perl_available() {
             eprintln!("skipping: no `perl` on PATH");
             return;
         }
-        let dir = dist_with(&[
-            ("META.json", META_JSON),
-            // Writes a MYMETA.json so read_mymeta has something to load.
-            (
-                "Build.PL",
-                "open my $fh, '>', 'MYMETA.json' or die $!;\n\
-                 print {$fh} '{\"name\":\"Foo-Bar\",\"version\":\"1.23\",\"meta-spec\":{\"version\":2}}';\n\
-                 close $fh;\n",
-            ),
-        ]);
+        // Build.PL writes a MYMETA.json with prereqs that differ from META.json.
+        let build_pl = "open my $fh, '>', 'MYMETA.json' or die $!;\n\
+             print {$fh} '{\"name\":\"Foo-Bar\",\"version\":\"1.23\",\"meta-spec\":{\"version\":2},\
+             \"prereqs\":{\"runtime\":{\"requires\":{\"Moo\":\"2.0\"}}}}';\n\
+             close $fh;\n";
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", build_pl)]);
         let mut dist = Distribution::new(dir.path()).unwrap();
         assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
 
-        dist.execute_configure().unwrap();
-        dist.read_mymeta().unwrap();
+        let deps = dist.execute_configure().unwrap();
         assert_eq!(dist.distribution_mymeta.as_ref().unwrap().name, "Foo-Bar");
+        assert_eq!(deps.runtime.requires, vec![dep("Moo", "2.0")]);
+    }
+
+    #[test]
+    fn execute_configure_without_mymeta_falls_back_to_distribution_meta() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[("META.json", META_MULTI_PHASE), ("Makefile.PL", "1;\n")]);
+        let mut dist = Distribution::new(dir.path()).unwrap();
+
+        let deps = dist.execute_configure().unwrap();
+        assert!(dist.distribution_mymeta.is_none());
+        assert_eq!(deps.test.requires, vec![dep("Test::More", "0.88")]);
     }
 
     #[test]
@@ -468,7 +607,7 @@ mod tests {
             ("META.json", META_JSON),
             ("Makefile.PL", "die \"boom\\n\";\n"),
         ]);
-        let dist = Distribution::new(dir.path()).unwrap();
+        let mut dist = Distribution::new(dir.path()).unwrap();
         let err = dist.execute_configure().unwrap_err();
         assert!(err.to_string().contains("Makefile.PL"));
     }
