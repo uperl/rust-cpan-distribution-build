@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use cpan_distribution_meta::Meta;
 
-use crate::perl::{ExecuteResult, Perl};
+use perl_wrapper::{ExecuteResult, Perl};
 
 /// The build tool a CPAN distribution uses for its configure step.
 ///

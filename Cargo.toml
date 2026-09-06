@@ -9,10 +9,10 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.104"
 cpan-distribution-meta = { git = "https://github.com/uperl/rust-cpan-distribution-meta.git", tag = "v0.1.1", version = "0.1.1" }
-os_pipe = "1"
-which = "8"
+perl-wrapper = { version = "0.1.0", path = "../rust-perl-wrapper" }
 
 [dev-dependencies]
 tempfile = "3"
+which = "8"
 
 
