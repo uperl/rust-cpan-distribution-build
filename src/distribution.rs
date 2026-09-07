@@ -368,6 +368,21 @@ impl Distribution {
         self.run_build_target(Some("clean"))
     }
 
+    /// Undo the configure step too, through [`perl`](Self::perl): `make
+    /// distclean` for [`BuildTool::Eumm`], or `perl Build distclean` for
+    /// [`BuildTool::ModuleBuild`].
+    ///
+    /// Like [`execute_clean`](Self::execute_clean), but also removes the
+    /// generated `Makefile` / `Build` script and the `MYMETA.*` files, returning
+    /// the tree to roughly its pre-[`execute_configure`](Self::execute_configure)
+    /// state. The generated script still has to be present to run this, so it
+    /// must be called before [`execute_clean`](Self::execute_clean); the
+    /// requirements and error behaviour are otherwise as for
+    /// [`execute_build`](Self::execute_build).
+    pub fn execute_distclean(&self) -> Result<ExecuteResult> {
+        self.run_build_target(Some("distclean"))
+    }
+
     /// Shared driver for [`execute_build`](Self::execute_build) and
     /// [`execute_test`](Self::execute_test): invoke the generated build script
     /// with an optional target (`None` builds the default target).
@@ -889,6 +904,54 @@ mod tests {
         let dist = Distribution::new(dir.path(), test_perl()).unwrap();
         assert!(
             dist.execute_clean()
+                .unwrap_err()
+                .to_string()
+                .contains("Build not found")
+        );
+    }
+
+    #[test]
+    fn execute_distclean_passes_the_distclean_target_for_module_build() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Build.PL", "1;\n"),
+            ("Build", "exit(($ARGV[0] // '') eq 'distclean' ? 0 : 1);\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+
+        assert!(dist.execute_distclean().unwrap().is_success);
+        assert!(!dist.execute_build().unwrap().is_success);
+    }
+
+    #[test]
+    fn execute_distclean_runs_make_distclean_for_eumm() {
+        if which::which("make").is_err() {
+            eprintln!("skipping: no `make` on PATH");
+            return;
+        }
+        let dir = dist_with(&[
+            ("META.json", META_JSON),
+            ("Makefile.PL", "1;\n"),
+            ("Makefile", "all:\n\t@false\ndistclean:\n\t@true\n"),
+        ]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+
+        assert!(dist.execute_distclean().unwrap().is_success);
+        assert!(!dist.execute_build().unwrap().is_success);
+    }
+
+    #[test]
+    fn execute_distclean_errors_before_configure() {
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert!(
+            dist.execute_distclean()
                 .unwrap_err()
                 .to_string()
                 .contains("Build not found")

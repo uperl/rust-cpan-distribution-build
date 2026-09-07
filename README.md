@@ -20,6 +20,7 @@ steps through a [`Perl`] wrapper.
 | Test | `execute_test` | `make test` | `perl Build test` |
 | Install | `execute_install` | `make install` | `perl Build install` |
 | Clean | `execute_clean` | `make clean` | `perl Build clean` |
+| Distclean | `execute_distclean` | `make distclean` | `perl Build distclean` |
 
 `execute_pre_configure` returns the `configure`-phase requirements from the
 metadata (minus `perl`), plus the build tool itself when the metadata does not
