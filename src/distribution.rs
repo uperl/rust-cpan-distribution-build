@@ -39,6 +39,29 @@ impl BuildTool {
         }
     }
 
+    /// The configure-step argument that forces a pure-Perl build — no XS is
+    /// compiled even where a working compiler and the XS sources are present:
+    /// the `PUREPERL_ONLY=1` [`WriteMakefile`] parameter for [`Eumm`], or the
+    /// `--pureperl-only` [`Build.PL`] option for [`ModuleBuild`].
+    ///
+    /// Passing it at configure time is enough: [`ExtUtils::MakeMaker`] bakes it
+    /// into the generated `Makefile` and [`Module::Build`] records it in
+    /// `_build/`, so the later build / test / install steps honour it without
+    /// the argument being repeated.
+    ///
+    /// [`Eumm`]: BuildTool::Eumm
+    /// [`ModuleBuild`]: BuildTool::ModuleBuild
+    /// [`WriteMakefile`]: https://metacpan.org/pod/ExtUtils::MakeMaker#PUREPERL_ONLY
+    /// [`Build.PL`]: https://metacpan.org/pod/Module::Build::API#%2Fpureperl-only
+    /// [`ExtUtils::MakeMaker`]: https://metacpan.org/pod/ExtUtils::MakeMaker
+    /// [`Module::Build`]: https://metacpan.org/pod/Module::Build
+    pub fn pure_perl_arg(self) -> &'static str {
+        match self {
+            BuildTool::Eumm => "PUREPERL_ONLY=1",
+            BuildTool::ModuleBuild => "--pureperl-only",
+        }
+    }
+
     /// The module assumed to provide this tool when the distribution's metadata
     /// does not name one.
     fn fallback_module(self) -> &'static str {
@@ -161,6 +184,9 @@ fn deps_from_map(map: &BTreeMap<String, String>) -> Vec<Dependency> {
 /// generated `MYMETA` metadata only exists once [`execute_configure`] has run;
 /// that method loads it, or you can load it on its own with [`read_mymeta`].
 ///
+/// Call [`with_pure_perl`](Self::with_pure_perl) before
+/// [`execute_configure`] to force a pure-Perl (no-XS) build.
+///
 /// [`execute_configure`]: Self::execute_configure
 /// [`read_mymeta`]: Self::read_mymeta
 #[derive(Debug, Clone)]
@@ -190,6 +216,13 @@ pub struct Distribution {
     /// the scripts present in [`root`](Self::root) and the preference passed to
     /// [`Distribution::with_preference`].
     pub build_tool: BuildTool,
+
+    /// When `true`, [`execute_configure`](Self::execute_configure) appends the
+    /// build tool's [`pure_perl_arg`](BuildTool::pure_perl_arg) so the
+    /// distribution is built without compiling XS. `false` (the default) leaves
+    /// the choice to the distribution and interpreter. Set with
+    /// [`with_pure_perl`](Self::with_pure_perl).
+    pub pure_perl: bool,
 }
 
 impl Distribution {
@@ -232,7 +265,22 @@ impl Distribution {
             distribution_meta,
             distribution_mymeta: None,
             build_tool,
+            pure_perl: false,
         })
+    }
+
+    /// Set whether the configure step forces a pure-Perl, no-XS build
+    /// ([`pure_perl`](Self::pure_perl)).
+    ///
+    /// With it enabled, [`execute_configure`](Self::execute_configure) passes
+    /// the build tool's [`pure_perl_arg`](BuildTool::pure_perl_arg)
+    /// (`PUREPERL_ONLY=1` for `ExtUtils::MakeMaker`, `--pureperl-only` for
+    /// `Module::Build`) as a configure-step argument — no environment variable
+    /// is set, and the later steps need no further flagging.
+    #[must_use]
+    pub fn with_pure_perl(mut self, pure_perl: bool) -> Self {
+        self.pure_perl = pure_perl;
+        self
     }
 
     /// The prerequisites that must be installed **before** the configure step
@@ -288,13 +336,21 @@ impl Distribution {
     /// afterwards it is parsed into [`distribution_mymeta`](Self::distribution_mymeta)
     /// and the returned [`Dependencies`] come from it; otherwise they come from
     /// [`distribution_meta`](Self::distribution_meta).
+    ///
+    /// When [`pure_perl`](Self::pure_perl) is set the build tool's
+    /// [`pure_perl_arg`](BuildTool::pure_perl_arg) is appended to the script's
+    /// arguments, so the distribution is built without XS.
     pub fn execute_configure(&mut self) -> Result<(ExecuteResult, Dependencies)> {
         let script = self.build_tool.configure_script();
         if !self.root.join(script).is_file() {
             bail!("{script} not found in {}", self.root.display());
         }
 
-        let result = self.perl.execute_perl([script])?;
+        let mut args = vec![script];
+        if self.pure_perl {
+            args.push(self.build_tool.pure_perl_arg());
+        }
+        let result = self.perl.execute_perl(args)?;
 
         if let Some(mymeta) = read_meta(&self.root, &["MYMETA.json", "MYMETA.yml"])? {
             self.distribution_mymeta = Some(mymeta);
@@ -727,6 +783,74 @@ mod tests {
         assert!(!result.is_success);
         assert!(dist.distribution_mymeta.is_none());
         assert_eq!(deps.runtime.requires, vec![dep("perl", "5.010")]);
+    }
+
+    #[test]
+    fn pure_perl_arg_is_the_configure_step_flag_for_each_tool() {
+        assert_eq!(BuildTool::Eumm.pure_perl_arg(), "PUREPERL_ONLY=1");
+        assert_eq!(BuildTool::ModuleBuild.pure_perl_arg(), "--pureperl-only");
+    }
+
+    #[test]
+    fn with_pure_perl_toggles_the_flag_off_by_default() {
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", "1;\n")]);
+        let dist = Distribution::new(dir.path(), test_perl()).unwrap();
+        assert!(!dist.pure_perl);
+        assert!(dist.clone().with_pure_perl(true).pure_perl);
+        assert!(!dist.with_pure_perl(true).with_pure_perl(false).pure_perl);
+    }
+
+    /// A configure script that records its `@ARGV`, one entry per line, in
+    /// `argv.txt` beside itself.
+    const DUMP_ARGV: &str =
+        "open my $fh, '>', 'argv.txt' or die $!; print {$fh} join qq(\\n), @ARGV; close $fh;\n";
+
+    #[test]
+    fn execute_configure_passes_pureperl_only_to_makefile_pl() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[("META.json", META_JSON), ("Makefile.PL", DUMP_ARGV)]);
+        let mut dist = Distribution::new(dir.path(), test_perl())
+            .unwrap()
+            .with_pure_perl(true);
+        assert_eq!(dist.build_tool, BuildTool::Eumm);
+
+        assert!(dist.execute_configure().unwrap().0.is_success);
+        let argv = fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert_eq!(argv.lines().collect::<Vec<_>>(), ["PUREPERL_ONLY=1"]);
+    }
+
+    #[test]
+    fn execute_configure_passes_pureperl_only_to_build_pl() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", DUMP_ARGV)]);
+        let mut dist = Distribution::new(dir.path(), test_perl())
+            .unwrap()
+            .with_pure_perl(true);
+        assert_eq!(dist.build_tool, BuildTool::ModuleBuild);
+
+        assert!(dist.execute_configure().unwrap().0.is_success);
+        let argv = fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert_eq!(argv.lines().collect::<Vec<_>>(), ["--pureperl-only"]);
+    }
+
+    #[test]
+    fn execute_configure_passes_no_extra_args_by_default() {
+        if !perl_available() {
+            eprintln!("skipping: no `perl` on PATH");
+            return;
+        }
+        let dir = dist_with(&[("META.json", META_JSON), ("Build.PL", DUMP_ARGV)]);
+        let mut dist = Distribution::new(dir.path(), test_perl()).unwrap();
+
+        assert!(dist.execute_configure().unwrap().0.is_success);
+        let argv = fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert!(argv.is_empty(), "expected no configure args, got {argv:?}");
     }
 
     #[test]
