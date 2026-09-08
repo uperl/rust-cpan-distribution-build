@@ -73,6 +73,33 @@ Use `Distribution::with_preference` instead of `Distribution::new` to choose
 between `ExtUtils::MakeMaker` and `Module::Build` when a distribution ships both
 `Makefile.PL` and `Build.PL`; `Module::Build` is the default.
 
+## Pure-Perl builds
+
+`Distribution::with_pure_perl(true)` forces a build with no compiled XS. It
+takes effect at the configure step, passing the flag as a **script argument**
+rather than an environment variable:
+
+| Build tool | Configure command |
+| --- | --- |
+| `ExtUtils::MakeMaker` | `perl Makefile.PL PUREPERL_ONLY=1` |
+| `Module::Build` | `perl Build.PL --pureperl-only` |
+
+`ExtUtils::MakeMaker` writes this into the generated `Makefile` and
+`Module::Build` records it under `_build/`, so `execute_build`, `execute_test`
+and `execute_install` pick it up with no further flagging. The exact string for
+a tool is available as `BuildTool::pure_perl_arg`.
+
+```rust
+# use cpan_distribution_build::{Distribution, Perl};
+# fn main() -> anyhow::Result<()> {
+let mut dist = Distribution::new("path/to/Foo-Bar-1.23", Perl::with_perl("perl"))?
+    .with_pure_perl(true);
+let (result, _deps) = dist.execute_configure()?;
+assert!(result.is_success);
+# Ok(())
+# }
+```
+
 ## Related crates
 
 - [`cpan-distribution-meta`](https://github.com/uperl/rust-cpan-distribution-meta) — parses `META.*` / `MYMETA.*` files.
